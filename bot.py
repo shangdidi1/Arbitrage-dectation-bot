@@ -1,5 +1,3 @@
-# Arbitrage-dectation-bot
-#detect the perp and spot price difference of the backpack exchange, use api and update every 30sec, 
 #!/usr/bin/env python3
 """
 Backpack Exchange Spot-Perpetual Arbitrage Monitor
@@ -69,7 +67,7 @@ class BackpackArbitrageMonitor:
     def __init__(self):
         self.base_url = "https://api.backpack.exchange"
         self.base_assets = ["SOL", "ETH", "BTC"]
-        self.spread_threshold = 0.06  # 0.06% threshold
+        self.spread_threshold = 0.04  # 0.04% threshold
         self.session = requests.Session()
         self.arbitrage_history = []
         self.csv_filename = "backpack_arbitrage_history.csv"
@@ -320,13 +318,164 @@ class BackpackArbitrageMonitor:
             self.log_arbitrage_data(arb_data)
             cycle_data.append(arb_data)
             
-            # Print current status
-            self._print_arbitrage_status(arb_data)
+            # Print current status with detailed depth analysis
+            self._print_arbitrage_status(arb_data, spot_data, perp_data)
         
         logger.info("=" * 80)
         return cycle_data
     
-    def _print_arbitrage_status(self, arb_data: ArbitrageData):
+    def calculate_execution_depth(self, orders: List, trade_size_usd: float, is_buy: bool = True) -> Dict:
+        """
+        Calculate execution depth and effective price for a given trade size
+        
+        Args:
+            orders: List of [price, quantity] orders from orderbook
+            trade_size_usd: Trade size in USD
+            is_buy: True for buying (using asks), False for selling (using bids)
+            
+        Returns:
+            Dict with execution details
+        """
+        try:
+            remaining_usd = trade_size_usd
+            total_quantity = 0
+            weighted_price_sum = 0
+            levels_used = 0
+            
+            for price, quantity in orders:
+                if remaining_usd <= 0:
+                    break
+                    
+                price_float = float(price)
+                quantity_float = float(quantity)
+                level_value_usd = price_float * quantity_float
+                
+                if remaining_usd >= level_value_usd:
+                    # Can consume entire level
+                    executed_value = level_value_usd
+                    executed_quantity = quantity_float
+                else:
+                    # Partial fill of this level
+                    executed_quantity = remaining_usd / price_float
+                    executed_value = remaining_usd
+                
+                total_quantity += executed_quantity
+                weighted_price_sum += price_float * executed_quantity
+                remaining_usd -= executed_value
+                levels_used += 1
+            
+            if total_quantity > 0:
+                effective_price = weighted_price_sum / total_quantity
+                filled_percentage = ((trade_size_usd - remaining_usd) / trade_size_usd) * 100
+                
+                return {
+                    'effective_price': effective_price,
+                    'total_quantity': total_quantity,
+                    'filled_usd': trade_size_usd - remaining_usd,
+                    'filled_percentage': filled_percentage,
+                    'levels_used': levels_used,
+                    'remaining_usd': remaining_usd,
+                    'fully_filled': remaining_usd <= 0
+                }
+            else:
+                return {
+                    'effective_price': 0,
+                    'total_quantity': 0,
+                    'filled_usd': 0,
+                    'filled_percentage': 0,
+                    'levels_used': 0,
+                    'remaining_usd': trade_size_usd,
+                    'fully_filled': False
+                }
+                
+        except Exception as e:
+            logger.error(f"Error calculating execution depth: {e}")
+            return None
+    
+    def _print_arbitrage_status(self, arb_data: ArbitrageData, spot_data: Dict = None, perp_data: Dict = None):
+        """Print detailed arbitrage status for a single asset with profitable depth analysis"""
+        
+        # Strategy 1 status
+        strategy1_status = "🟢 ACTIONABLE" if arb_data.long_spot_actionable else "🔴 NOT ACTIONABLE"
+        strategy2_status = "🟢 ACTIONABLE" if arb_data.long_perp_actionable else "🔴 NOT ACTIONABLE"
+        
+        logger.info(f"""
+📊 {arb_data.base_asset} ARBITRAGE ANALYSIS:
+        """)
+        
+        # Strategy 1 Analysis
+        logger.info(f"📈 STRATEGY 1 - Long Spot, Short Perp: {strategy1_status}")
+        logger.info(f"├─ Buy {arb_data.spot_symbol} at: ${arb_data.spot_best_ask:.4f}")
+        logger.info(f"├─ Sell {arb_data.perp_symbol} at: ${arb_data.perp_best_bid:.4f}")
+        logger.info(f"├─ Spread: ${arb_data.long_spot_short_perp_spread:.4f} ({arb_data.long_spot_short_perp_spread_pct:.4f}%)")
+        
+        if arb_data.long_spot_actionable and spot_data and perp_data:
+            logger.info(f"├─ 💰 PROFITABLE TRADE DEPTH ANALYSIS:")
+            
+            # Test different trade sizes for profitable strategy
+            trade_sizes = [1000, 5000, 10000, 25000]  # USD amounts
+            
+            for size in trade_sizes:
+                # Calculate spot ask execution (buying spot)
+                spot_exec = self.calculate_execution_depth(spot_data['asks'], size, is_buy=True)
+                # Calculate perp bid execution (selling perp)  
+                perp_exec = self.calculate_execution_depth(perp_data['bids'], size, is_buy=False)
+                
+                if spot_exec and perp_exec and spot_exec['fully_filled'] and perp_exec['fully_filled']:
+                    actual_spread = perp_exec['effective_price'] - spot_exec['effective_price']
+                    actual_spread_pct = (actual_spread / spot_exec['effective_price']) * 100
+                    
+                    profit_usd = actual_spread * spot_exec['total_quantity']
+                    
+                    logger.info(f"│  └─ ${size:,} trade:")
+                    logger.info(f"│     ├─ Buy ${size:,} spot at avg: ${spot_exec['effective_price']:.4f} ({spot_exec['levels_used']} levels)")
+                    logger.info(f"│     ├─ Sell equivalent perp at avg: ${perp_exec['effective_price']:.4f} ({perp_exec['levels_used']} levels)")
+                    logger.info(f"│     ├─ Actual spread: ${actual_spread:.4f} ({actual_spread_pct:.4f}%)")
+                    logger.info(f"│     └─ Est. profit: ${profit_usd:.2f}")
+                elif not (spot_exec['fully_filled'] and perp_exec['fully_filled']):
+                    logger.info(f"│  └─ ${size:,} trade: ❌ Insufficient liquidity")
+                    break
+        else:
+            logger.info(f"└─ Total Depth: Spot Ask ${arb_data.spot_ask_depth_5:,.2f} | Perp Bid ${arb_data.perp_bid_depth_5:,.2f}")
+        
+        logger.info("")
+        
+        # Strategy 2 Analysis  
+        logger.info(f"📉 STRATEGY 2 - Long Perp, Short Spot: {strategy2_status}")
+        logger.info(f"├─ Buy {arb_data.perp_symbol} at: ${arb_data.perp_best_ask:.4f}")
+        logger.info(f"├─ Sell {arb_data.spot_symbol} at: ${arb_data.spot_best_bid:.4f}")
+        logger.info(f"├─ Spread: ${arb_data.long_perp_short_spot_spread:.4f} ({arb_data.long_perp_short_spot_spread_pct:.4f}%)")
+        
+        if arb_data.long_perp_actionable and spot_data and perp_data:
+            logger.info(f"├─ 💰 PROFITABLE TRADE DEPTH ANALYSIS:")
+            
+            # Test different trade sizes for profitable strategy
+            trade_sizes = [1000, 5000, 10000, 25000]  # USD amounts
+            
+            for size in trade_sizes:
+                # Calculate perp ask execution (buying perp)
+                perp_exec = self.calculate_execution_depth(perp_data['asks'], size, is_buy=True)
+                # Calculate spot bid execution (selling spot)
+                spot_exec = self.calculate_execution_depth(spot_data['bids'], size, is_buy=False)
+                
+                if spot_exec and perp_exec and spot_exec['fully_filled'] and perp_exec['fully_filled']:
+                    actual_spread = spot_exec['effective_price'] - perp_exec['effective_price']
+                    actual_spread_pct = (actual_spread / perp_exec['effective_price']) * 100
+                    
+                    profit_usd = actual_spread * perp_exec['total_quantity']
+                    
+                    logger.info(f"│  └─ ${size:,} trade:")
+                    logger.info(f"│     ├─ Buy ${size:,} perp at avg: ${perp_exec['effective_price']:.4f} ({perp_exec['levels_used']} levels)")
+                    logger.info(f"│     ├─ Sell equivalent spot at avg: ${spot_exec['effective_price']:.4f} ({spot_exec['levels_used']} levels)")
+                    logger.info(f"│     ├─ Actual spread: ${actual_spread:.4f} ({actual_spread_pct:.4f}%)")
+                    logger.info(f"│     └─ Est. profit: ${profit_usd:.2f}")
+                elif not (spot_exec['fully_filled'] and perp_exec['fully_filled']):
+                    logger.info(f"│  └─ ${size:,} trade: ❌ Insufficient liquidity") 
+                    break
+        else:
+            logger.info(f"└─ Total Depth: Perp Ask ${arb_data.perp_ask_depth_5:,.2f} | Spot Bid ${arb_data.spot_bid_depth_5:,.2f}")
+        
+        logger.info("")
         """Print detailed arbitrage status for a single asset"""
         
         # Strategy 1 status
@@ -476,7 +625,7 @@ class BackpackArbitrageMonitor:
                 asset_data = df[df['base_asset'] == asset]
                 ax1.plot(asset_data['timestamp'], asset_data['long_spot_short_perp_spread_pct'], 
                         label=f'{asset} Long Spot/Short Perp', marker='o', markersize=2)
-            ax1.axhline(y=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold')
+            ax1.axhline(y=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold (0.04%)')
             ax1.set_title('Strategy 1: Long Spot, Short Perp Spreads')
             ax1.set_ylabel('Spread (%)')
             ax1.legend()
@@ -554,7 +703,7 @@ class BackpackArbitrageMonitor:
         except Exception as e:
             logger.error(f"Error creating visualization: {e}")
     
-    def run_continuous_monitoring(self, interval_seconds: int = 30, max_cycles: int = None):
+    def run_continuous_monitoring(self, interval_seconds: int = 1, max_cycles: int = None):
         """
         Run continuous arbitrage monitoring
         
@@ -624,7 +773,7 @@ def main():
     # monitor.print_analysis_report()
     
     # 2. Continuous monitoring (uncomment to use)
-    monitor.run_continuous_monitoring(interval_seconds=30, max_cycles=20)
+    monitor.run_continuous_monitoring(interval_seconds=1, max_cycles=100)
     
     # 3. Generate visualization (uncomment to use)
     # monitor.create_visualization()
