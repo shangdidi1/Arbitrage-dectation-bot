@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
-Backpack Exchange Spot-Perpetual Arbitrage Monitor
+Backpack Exchange Spot-Perpetual Arbitrage Monitor with Funding Rate Analysis
 Monitors SOL, ETH, and BTC spot vs perpetual price differences for arbitrage opportunities
-Calculates spread between spot bid/perp ask and perp bid/spot ask
+Includes funding rate history and current funding analysis for better decision making
 """
 
 import requests
@@ -18,6 +18,11 @@ import seaborn as sns
 from dataclasses import dataclass
 import statistics
 import os
+from tabulate import tabulate
+from colorama import Fore, Style, init
+
+# Initialize colorama for colored output
+init(autoreset=True)
 
 # Setup logging
 logging.basicConfig(
@@ -30,6 +35,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@dataclass
+class FundingData:
+    """Data class for funding rate information"""
+    current_funding_rate: float
+    next_funding_time: datetime
+    time_until_funding: str
+    funding_history: List[Dict]  # Last 3 funding periods
+    
 @dataclass
 class ArbitrageData:
     """Data class for arbitrage opportunity information"""
@@ -61,6 +74,14 @@ class ArbitrageData:
     long_perp_short_spot_spread_pct: float
     long_perp_actionable: bool
     
+    # Premium/Discount info
+    perp_premium: float  # Positive if perp > spot
+    perp_premium_pct: float
+    expensive_leg: str  # "SPOT" or "PERP"
+    
+    # Funding data
+    funding_data: Optional[FundingData] = None
+    
 class BackpackArbitrageMonitor:
     """Main class for monitoring Backpack Exchange spot-perp arbitrage"""
     
@@ -90,7 +111,8 @@ class BackpackArbitrageMonitor:
                 'spot_best_bid', 'spot_best_ask', 'spot_bid_depth_5', 'spot_ask_depth_5',
                 'perp_best_bid', 'perp_best_ask', 'perp_bid_depth_5', 'perp_ask_depth_5',
                 'long_spot_short_perp_spread', 'long_spot_short_perp_spread_pct', 'long_spot_actionable',
-                'long_perp_short_spot_spread', 'long_perp_short_spot_spread_pct', 'long_perp_actionable'
+                'long_perp_short_spot_spread', 'long_perp_short_spot_spread_pct', 'long_perp_actionable',
+                'perp_premium', 'perp_premium_pct', 'expensive_leg', 'current_funding_rate'
             ]
             with open(self.csv_filename, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -98,15 +120,7 @@ class BackpackArbitrageMonitor:
             logger.info(f"Created new CSV file: {self.csv_filename}")
     
     def get_orderbook(self, symbol: str) -> Optional[Dict]:
-        """
-        Fetch orderbook data from Backpack Exchange
-        
-        Args:
-            symbol: Trading symbol (e.g., "SOL_USDC", "SOL_USDC_PERP")
-            
-        Returns:
-            Orderbook data or None if error
-        """
+        """Fetch orderbook data from Backpack Exchange"""
         try:
             url = f"{self.base_url}/api/v1/depth"
             params = {"symbol": symbol}
@@ -129,17 +143,52 @@ class BackpackArbitrageMonitor:
             logger.error(f"Failed to parse JSON for {symbol}: {e}")
             return None
     
-    def process_orderbook(self, orderbook: Dict, symbol: str) -> Optional[Dict]:
-        """
-        Process orderbook data and return best bid/ask with depth
-        
-        Args:
-            orderbook: Raw orderbook data
-            symbol: Trading symbol for logging
+    def get_funding_data(self, perp_symbol: str) -> Optional[FundingData]:
+        """Fetch current and historical funding rate data"""
+        try:
+            # Get current funding rate and next funding time
+            mark_url = f"{self.base_url}/api/v1/markPrices"
+            params = {"symbol": perp_symbol}
             
-        Returns:
-            Processed orderbook data or None if error
-        """
+            response = self.session.get(mark_url, params=params, timeout=10)
+            response.raise_for_status()
+            mark_data = response.json()
+            
+            if not mark_data or len(mark_data) == 0:
+                logger.error(f"No mark price data for {perp_symbol}")
+                return None
+            
+            mark_info = mark_data[0]
+            current_funding_rate = float(mark_info.get('fundingRate', 0))
+            next_funding_timestamp = int(mark_info.get('nextFundingTimestamp', 0))
+            
+            # Convert to datetime and calculate time until funding
+            next_funding_time = datetime.fromtimestamp(next_funding_timestamp / 1000)
+            time_until_funding = next_funding_time - datetime.now()
+            hours_until = time_until_funding.total_seconds() / 3600
+            time_until_str = f"{int(hours_until)}h {int((hours_until % 1) * 60)}m"
+            
+            # Get funding rate history (last 3 periods)
+            history_url = f"{self.base_url}/api/v1/fundingRates"
+            history_params = {"symbol": perp_symbol, "limit": 3}
+            
+            history_response = self.session.get(history_url, params=history_params, timeout=10)
+            history_response.raise_for_status()
+            funding_history = history_response.json()
+            
+            return FundingData(
+                current_funding_rate=current_funding_rate,
+                next_funding_time=next_funding_time,
+                time_until_funding=time_until_str,
+                funding_history=funding_history
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch funding data for {perp_symbol}: {e}")
+            return None
+    
+    def process_orderbook(self, orderbook: Dict, symbol: str) -> Optional[Dict]:
+        """Process orderbook data and return best bid/ask with depth"""
         try:
             bids = orderbook.get("bids", [])
             asks = orderbook.get("asks", [])
@@ -149,12 +198,10 @@ class BackpackArbitrageMonitor:
                 return None
             
             # Sort orderbook to ensure correct order
-            # Bids should be sorted by price descending (highest price first)
-            # Asks should be sorted by price ascending (lowest price first)
             bids_sorted = sorted(bids, key=lambda x: float(x[0]), reverse=True)
             asks_sorted = sorted(asks, key=lambda x: float(x[0]), reverse=False)
             
-            # Get best bid (highest price) and ask (lowest price)
+            # Get best bid and ask
             best_bid = float(bids_sorted[0][0])
             best_ask = float(asks_sorted[0][0])
             
@@ -180,26 +227,20 @@ class BackpackArbitrageMonitor:
             logger.error(f"Error processing orderbook for {symbol}: {e}")
             return None
     
-    def calculate_arbitrage_opportunities(self, base_asset: str, spot_data: Dict, perp_data: Dict) -> Optional[ArbitrageData]:
-        """
-        Calculate arbitrage opportunities between spot and perpetual markets
-        
-        Args:
-            base_asset: Base asset (SOL, ETH, BTC)
-            spot_data: Processed spot orderbook data
-            perp_data: Processed perp orderbook data
-            
-        Returns:
-            ArbitrageData object or None if calculation fails
-        """
+    def calculate_arbitrage_opportunities(self, base_asset: str, spot_data: Dict, perp_data: Dict, funding_data: Optional[FundingData]) -> Optional[ArbitrageData]:
+        """Calculate arbitrage opportunities between spot and perpetual markets"""
         try:
             spot_symbol = self.trading_pairs[base_asset]["spot"]
             perp_symbol = self.trading_pairs[base_asset]["perp"]
             
-            # Strategy 1: Buy spot, sell perp (long spot, short perp)
-            # Compare spot ask price (what we pay to buy spot) vs perp bid price (what we receive selling perp)
-            # Actually, for arbitrage we want: spot bid (what we can sell spot for) vs perp ask (what we pay for perp)
-            # Wait, let me think about this correctly:
+            # Calculate mid prices
+            spot_mid = (spot_data['best_bid'] + spot_data['best_ask']) / 2
+            perp_mid = (perp_data['best_bid'] + perp_data['best_ask']) / 2
+            
+            # Calculate perp premium/discount
+            perp_premium = perp_mid - spot_mid
+            perp_premium_pct = (perp_premium / spot_mid) * 100
+            expensive_leg = "PERP" if perp_premium > 0 else "SPOT"
             
             # Strategy 1: Buy spot at spot_ask, sell perp at perp_bid
             # Profit = perp_bid - spot_ask
@@ -235,7 +276,13 @@ class BackpackArbitrageMonitor:
                 
                 long_perp_short_spot_spread=long_perp_short_spot_spread,
                 long_perp_short_spot_spread_pct=long_perp_short_spot_spread_pct,
-                long_perp_actionable=long_perp_actionable
+                long_perp_actionable=long_perp_actionable,
+                
+                perp_premium=perp_premium,
+                perp_premium_pct=perp_premium_pct,
+                expensive_leg=expensive_leg,
+                
+                funding_data=funding_data
             )
             
         except (ValueError, KeyError) as e:
@@ -263,7 +310,11 @@ class BackpackArbitrageMonitor:
                 arb_data.long_spot_actionable,
                 arb_data.long_perp_short_spot_spread,
                 arb_data.long_perp_short_spot_spread_pct,
-                arb_data.long_perp_actionable
+                arb_data.long_perp_actionable,
+                arb_data.perp_premium,
+                arb_data.perp_premium_pct,
+                arb_data.expensive_leg,
+                arb_data.funding_data.current_funding_rate if arb_data.funding_data else 0
             ]
             
             with open(self.csv_filename, 'a', newline='') as f:
@@ -273,26 +324,41 @@ class BackpackArbitrageMonitor:
         except Exception as e:
             logger.error(f"Error logging arbitrage data: {e}")
     
+    def format_spread_color(self, spread_pct: float, actionable: bool) -> str:
+        """Format spread percentage with color based on actionability"""
+        if actionable:
+            return f"{Fore.GREEN}{spread_pct:+.4f}%{Style.RESET_ALL}"
+        elif spread_pct > 0:
+            return f"{Fore.YELLOW}{spread_pct:+.4f}%{Style.RESET_ALL}"
+        else:
+            return f"{Fore.RED}{spread_pct:+.4f}%{Style.RESET_ALL}"
+    
+    def format_funding_rate(self, rate: float) -> str:
+        """Format funding rate with color (positive = red for longs, green for shorts)"""
+        rate_pct = rate * 100  # Convert to percentage
+        if rate > 0:
+            return f"{Fore.RED}{rate_pct:+.4f}%{Style.RESET_ALL}"
+        elif rate < 0:
+            return f"{Fore.GREEN}{rate_pct:+.4f}%{Style.RESET_ALL}"
+        else:
+            return f"{rate_pct:.4f}%"
+    
     def monitor_single_cycle(self) -> List[ArbitrageData]:
-        """
-        Monitor all asset pairs for one cycle
-        
-        Returns:
-            List of ArbitrageData objects
-        """
+        """Monitor all asset pairs for one cycle with enhanced display"""
         cycle_data = []
         
-        logger.info("=" * 80)
-        logger.info("BACKPACK SPOT-PERP ARBITRAGE MONITOR - CYCLE START")
-        logger.info("=" * 80)
+        print("\n" + "="*150)
+        print(f"{Fore.CYAN}BACKPACK SPOT-PERP ARBITRAGE MONITOR - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
+        print("="*150)
+        
+        # Collect all data first
+        all_arb_data = []
         
         for base_asset in self.base_assets:
-            logger.info(f"Analyzing {base_asset} arbitrage opportunities...")
-            
             spot_symbol = self.trading_pairs[base_asset]["spot"]
             perp_symbol = self.trading_pairs[base_asset]["perp"]
             
-            # Fetch orderbooks for both markets
+            # Fetch orderbooks
             spot_orderbook = self.get_orderbook(spot_symbol)
             perp_orderbook = self.get_orderbook(perp_symbol)
             
@@ -308,197 +374,238 @@ class BackpackArbitrageMonitor:
                 logger.warning(f"Failed to process orderbooks for {base_asset}")
                 continue
             
-            # Calculate arbitrage opportunities
-            arb_data = self.calculate_arbitrage_opportunities(base_asset, spot_data, perp_data)
+            # Get funding data
+            funding_data = self.get_funding_data(perp_symbol)
+            
+            # Calculate arbitrage
+            arb_data = self.calculate_arbitrage_opportunities(base_asset, spot_data, perp_data, funding_data)
             if not arb_data:
                 continue
             
-            # Add to history and log to CSV
+            # Add to history and log
             self.arbitrage_history.append(arb_data)
             self.log_arbitrage_data(arb_data)
             cycle_data.append(arb_data)
-            
-            # Print current status with detailed depth analysis
-            self._print_arbitrage_status(arb_data, spot_data, perp_data)
+            all_arb_data.append((arb_data, spot_data, perp_data))
         
-        logger.info("=" * 80)
+        # Display premium/discount analysis
+        self._display_premium_analysis(all_arb_data)
+        
+        # Display funding rate analysis
+        self._display_funding_analysis(all_arb_data)
+        
+        # Display spread and strategy summary
+        self._display_strategy_summary(all_arb_data)
+        
+        # Display actionable opportunities with funding considerations
+        self._display_actionable_opportunities(cycle_data)
+        
         return cycle_data
     
-    def calculate_execution_depth(self, orders: List, trade_size_usd: float, is_buy: bool = True) -> Dict:
-        """
-        Calculate execution depth and effective price for a given trade size
+    def _display_premium_analysis(self, all_arb_data: List[Tuple[ArbitrageData, Dict, Dict]]):
+        """Display which market is trading at premium/discount"""
+        print(f"\n{Fore.CYAN}📊 MARKET PREMIUM/DISCOUNT ANALYSIS{Style.RESET_ALL}")
+        print("─" * 150)
         
-        Args:
-            orders: List of [price, quantity] orders from orderbook
-            trade_size_usd: Trade size in USD
-            is_buy: True for buying (using asks), False for selling (using bids)
+        table_data = []
+        headers = ["Asset", "Spot Mid", "Perp Mid", "Premium", "Premium %", "Expensive Leg", "Market Status"]
+        
+        for arb_data, spot_data, perp_data in all_arb_data:
+            spot_mid = (arb_data.spot_best_bid + arb_data.spot_best_ask) / 2
+            perp_mid = (arb_data.perp_best_bid + arb_data.perp_best_ask) / 2
             
-        Returns:
-            Dict with execution details
-        """
-        try:
-            remaining_usd = trade_size_usd
-            total_quantity = 0
-            weighted_price_sum = 0
-            levels_used = 0
-            
-            for price, quantity in orders:
-                if remaining_usd <= 0:
-                    break
-                    
-                price_float = float(price)
-                quantity_float = float(quantity)
-                level_value_usd = price_float * quantity_float
-                
-                if remaining_usd >= level_value_usd:
-                    # Can consume entire level
-                    executed_value = level_value_usd
-                    executed_quantity = quantity_float
-                else:
-                    # Partial fill of this level
-                    executed_quantity = remaining_usd / price_float
-                    executed_value = remaining_usd
-                
-                total_quantity += executed_quantity
-                weighted_price_sum += price_float * executed_quantity
-                remaining_usd -= executed_value
-                levels_used += 1
-            
-            if total_quantity > 0:
-                effective_price = weighted_price_sum / total_quantity
-                filled_percentage = ((trade_size_usd - remaining_usd) / trade_size_usd) * 100
-                
-                return {
-                    'effective_price': effective_price,
-                    'total_quantity': total_quantity,
-                    'filled_usd': trade_size_usd - remaining_usd,
-                    'filled_percentage': filled_percentage,
-                    'levels_used': levels_used,
-                    'remaining_usd': remaining_usd,
-                    'fully_filled': remaining_usd <= 0
-                }
+            # Determine market status
+            if abs(arb_data.perp_premium_pct) < 0.01:
+                market_status = "🟢 BALANCED"
+            elif arb_data.expensive_leg == "PERP":
+                market_status = "📈 PERP PREMIUM (Spot Cheap)"
             else:
-                return {
-                    'effective_price': 0,
-                    'total_quantity': 0,
-                    'filled_usd': 0,
-                    'filled_percentage': 0,
-                    'levels_used': 0,
-                    'remaining_usd': trade_size_usd,
-                    'fully_filled': False
-                }
-                
-        except Exception as e:
-            logger.error(f"Error calculating execution depth: {e}")
-            return None
+                market_status = "📉 SPOT PREMIUM (Perp Cheap)"
+            
+            # Color code the premium
+            if abs(arb_data.perp_premium_pct) > 0.05:
+                premium_str = f"{Fore.YELLOW}{arb_data.perp_premium:+.4f}{Style.RESET_ALL}"
+                premium_pct_str = f"{Fore.YELLOW}{arb_data.perp_premium_pct:+.4f}%{Style.RESET_ALL}"
+            else:
+                premium_str = f"{arb_data.perp_premium:+.4f}"
+                premium_pct_str = f"{arb_data.perp_premium_pct:+.4f}%"
+            
+            table_data.append([
+                arb_data.base_asset,
+                f"${spot_mid:.4f}",
+                f"${perp_mid:.4f}",
+                premium_str,
+                premium_pct_str,
+                arb_data.expensive_leg,
+                market_status
+            ])
+        
+        print(tabulate(table_data, headers=headers, tablefmt="grid", numalign="right"))
     
-    def _print_arbitrage_status(self, arb_data: ArbitrageData, spot_data: Dict = None, perp_data: Dict = None):
-        """Print detailed arbitrage status for a single asset with profitable depth analysis"""
+    def _display_funding_analysis(self, all_arb_data: List[Tuple[ArbitrageData, Dict, Dict]]):
+        """Display funding rate analysis"""
+        print(f"\n{Fore.CYAN}💰 FUNDING RATE ANALYSIS{Style.RESET_ALL}")
+        print("─" * 150)
         
-        # Strategy 1 status
-        strategy1_status = "🟢 ACTIONABLE" if arb_data.long_spot_actionable else "🔴 NOT ACTIONABLE"
-        strategy2_status = "🟢 ACTIONABLE" if arb_data.long_perp_actionable else "🔴 NOT ACTIONABLE"
+        table_data = []
+        headers = ["Asset", "Current Rate", "Next Payment", "Last 3 Periods", "Avg Rate", "Strategy Impact"]
         
-        logger.info(f"""
-📊 {arb_data.base_asset} ARBITRAGE ANALYSIS:
-        """)
-        
-        # Strategy 1 Analysis
-        logger.info(f"📈 STRATEGY 1 - Long Spot, Short Perp: {strategy1_status}")
-        logger.info(f"├─ Buy {arb_data.spot_symbol} at: ${arb_data.spot_best_ask:.4f}")
-        logger.info(f"├─ Sell {arb_data.perp_symbol} at: ${arb_data.perp_best_bid:.4f}")
-        logger.info(f"├─ Spread: ${arb_data.long_spot_short_perp_spread:.4f} ({arb_data.long_spot_short_perp_spread_pct:.4f}%)")
-        
-        if arb_data.long_spot_actionable and spot_data and perp_data:
-            logger.info(f"├─ 💰 PROFITABLE TRADE DEPTH ANALYSIS:")
+        for arb_data, spot_data, perp_data in all_arb_data:
+            if not arb_data.funding_data:
+                continue
             
-            # Test different trade sizes for profitable strategy
-            trade_sizes = [1000, 5000, 10000, 25000]  # USD amounts
+            funding = arb_data.funding_data
             
-            for size in trade_sizes:
-                # Calculate spot ask execution (buying spot)
-                spot_exec = self.calculate_execution_depth(spot_data['asks'], size, is_buy=True)
-                # Calculate perp bid execution (selling perp)  
-                perp_exec = self.calculate_execution_depth(perp_data['bids'], size, is_buy=False)
-                
-                if spot_exec and perp_exec and spot_exec['fully_filled'] and perp_exec['fully_filled']:
-                    actual_spread = perp_exec['effective_price'] - spot_exec['effective_price']
-                    actual_spread_pct = (actual_spread / spot_exec['effective_price']) * 100
-                    
-                    profit_usd = actual_spread * spot_exec['total_quantity']
-                    
-                    logger.info(f"│  └─ ${size:,} trade:")
-                    logger.info(f"│     ├─ Buy ${size:,} spot at avg: ${spot_exec['effective_price']:.4f} ({spot_exec['levels_used']} levels)")
-                    logger.info(f"│     ├─ Sell equivalent perp at avg: ${perp_exec['effective_price']:.4f} ({perp_exec['levels_used']} levels)")
-                    logger.info(f"│     ├─ Actual spread: ${actual_spread:.4f} ({actual_spread_pct:.4f}%)")
-                    logger.info(f"│     └─ Est. profit: ${profit_usd:.2f}")
-                elif not (spot_exec['fully_filled'] and perp_exec['fully_filled']):
-                    logger.info(f"│  └─ ${size:,} trade: ❌ Insufficient liquidity")
-                    break
+            # Format last 3 periods
+            last_3_rates = []
+            for hist in funding.funding_history[:3]:
+                rate = float(hist.get('fundingRate', 0)) * 100
+                last_3_rates.append(f"{rate:+.4f}%")
+            last_3_str = " | ".join(last_3_rates) if last_3_rates else "N/A"
+            
+            # Calculate average rate
+            if funding.funding_history:
+                avg_rate = sum(float(h.get('fundingRate', 0)) for h in funding.funding_history[:3]) / len(funding.funding_history[:3])
+                avg_rate_str = self.format_funding_rate(avg_rate)
+            else:
+                avg_rate_str = "N/A"
+            
+            # Strategy impact
+            current_rate = funding.current_funding_rate
+            if current_rate > 0:
+                impact = "📈 S1 ✓ (receive) | S2 ✗ (pay)"
+            elif current_rate < 0:
+                impact = "📉 S1 ✗ (pay) | S2 ✓ (receive)"
+            else:
+                impact = "➖ Neutral"
+            
+            table_data.append([
+                arb_data.base_asset,
+                self.format_funding_rate(current_rate),
+                funding.time_until_funding,
+                last_3_str,
+                avg_rate_str,
+                impact
+            ])
+        
+        print(tabulate(table_data, headers=headers, tablefmt="grid", numalign="right"))
+        
+        # Add funding strategy guide
+        print(f"\n{Fore.YELLOW}📌 Funding Strategy Guide:{Style.RESET_ALL}")
+        print("   • S1 (Long Spot, Short Perp): Positive funding = RECEIVE | Negative funding = PAY")
+        print("   • S2 (Long Perp, Short Spot): Positive funding = PAY | Negative funding = RECEIVE")
+    
+    def _display_strategy_summary(self, all_arb_data: List[Tuple[ArbitrageData, Dict, Dict]]):
+        """Display strategy summary with clear trade directions"""
+        print(f"\n{Fore.CYAN}📈 STRATEGY SUMMARY{Style.RESET_ALL}")
+        print("─" * 150)
+        
+        table_data = []
+        headers = ["Asset", "Strategy 1 (S1)", "S1 Spread", "Strategy 2 (S2)", "S2 Spread", "Recommended"]
+        
+        for arb_data, spot_data, perp_data in all_arb_data:
+            # Strategy 1 details
+            s1_details = f"Buy Spot@${arb_data.spot_best_ask:.2f} | Sell Perp@${arb_data.perp_best_bid:.2f}"
+            s1_spread = self.format_spread_color(arb_data.long_spot_short_perp_spread_pct, arb_data.long_spot_actionable)
+            
+            # Strategy 2 details
+            s2_details = f"Buy Perp@${arb_data.perp_best_ask:.2f} | Sell Spot@${arb_data.spot_best_bid:.2f}"
+            s2_spread = self.format_spread_color(arb_data.long_perp_short_spot_spread_pct, arb_data.long_perp_actionable)
+            
+            # Recommendation based on spread and funding
+            recommendation = self._get_strategy_recommendation(arb_data)
+            
+            table_data.append([
+                arb_data.base_asset,
+                s1_details,
+                s1_spread,
+                s2_details,
+                s2_spread,
+                recommendation
+            ])
+        
+        print(tabulate(table_data, headers=headers, tablefmt="grid", numalign="right"))
+    
+    def _get_strategy_recommendation(self, arb_data: ArbitrageData) -> str:
+        """Get strategy recommendation based on spread and funding"""
+        if not arb_data.long_spot_actionable and not arb_data.long_perp_actionable:
+            return "⚪ None"
+        
+        # If only one is actionable, easy choice
+        if arb_data.long_spot_actionable and not arb_data.long_perp_actionable:
+            return "🔵 S1"
+        elif arb_data.long_perp_actionable and not arb_data.long_spot_actionable:
+            return "🟣 S2"
+        
+        # Both actionable - consider funding
+        if arb_data.funding_data:
+            funding_rate = arb_data.funding_data.current_funding_rate
+            
+            # Positive funding favors S1 (short perp receives funding)
+            # Negative funding favors S2 (long perp receives funding)
+            if funding_rate > 0.0001:  # Significantly positive
+                return "🔵 S1 (funding favorable)"
+            elif funding_rate < -0.0001:  # Significantly negative
+                return "🟣 S2 (funding favorable)"
+        
+        # If funding neutral or no data, choose higher spread
+        if arb_data.long_spot_short_perp_spread_pct > arb_data.long_perp_short_spot_spread_pct:
+            return "🔵 S1 (higher spread)"
         else:
-            logger.info(f"└─ Total Depth: Spot Ask ${arb_data.spot_ask_depth_5:,.2f} | Perp Bid ${arb_data.perp_bid_depth_5:,.2f}")
+            return "🟣 S2 (higher spread)"
+    
+    def _display_actionable_opportunities(self, cycle_data: List[ArbitrageData]):
+        """Display actionable opportunities with funding considerations"""
+        strategy1_opportunities = [data for data in cycle_data if data.long_spot_actionable]
+        strategy2_opportunities = [data for data in cycle_data if data.long_perp_actionable]
         
-        logger.info("")
+        total_opportunities = len(strategy1_opportunities) + len(strategy2_opportunities)
         
-        # Strategy 2 Analysis  
-        logger.info(f"📉 STRATEGY 2 - Long Perp, Short Spot: {strategy2_status}")
-        logger.info(f"├─ Buy {arb_data.perp_symbol} at: ${arb_data.perp_best_ask:.4f}")
-        logger.info(f"├─ Sell {arb_data.spot_symbol} at: ${arb_data.spot_best_bid:.4f}")
-        logger.info(f"├─ Spread: ${arb_data.long_perp_short_spot_spread:.4f} ({arb_data.long_perp_short_spot_spread_pct:.4f}%)")
+        print(f"\n{Fore.CYAN}🎯 ACTIONABLE OPPORTUNITIES WITH FUNDING ANALYSIS{Style.RESET_ALL}")
+        print("─" * 150)
         
-        if arb_data.long_perp_actionable and spot_data and perp_data:
-            logger.info(f"├─ 💰 PROFITABLE TRADE DEPTH ANALYSIS:")
-            
-            # Test different trade sizes for profitable strategy
-            trade_sizes = [1000, 5000, 10000, 25000]  # USD amounts
-            
-            for size in trade_sizes:
-                # Calculate perp ask execution (buying perp)
-                perp_exec = self.calculate_execution_depth(perp_data['asks'], size, is_buy=True)
-                # Calculate spot bid execution (selling spot)
-                spot_exec = self.calculate_execution_depth(spot_data['bids'], size, is_buy=False)
-                
-                if spot_exec and perp_exec and spot_exec['fully_filled'] and perp_exec['fully_filled']:
-                    actual_spread = spot_exec['effective_price'] - perp_exec['effective_price']
-                    actual_spread_pct = (actual_spread / perp_exec['effective_price']) * 100
+        if total_opportunities > 0:
+            if strategy1_opportunities:
+                print(f"\n{Fore.GREEN}📈 Strategy 1 - Long Spot, Short Perp ({len(strategy1_opportunities)} opportunities):{Style.RESET_ALL}")
+                for data in strategy1_opportunities:
+                    max_trade = min(data.spot_ask_depth_5, data.perp_bid_depth_5)
+                    estimated_profit = max_trade * (data.long_spot_short_perp_spread_pct / 100)
                     
-                    profit_usd = actual_spread * perp_exec['total_quantity']
+                    # Funding consideration
+                    funding_impact = ""
+                    if data.funding_data:
+                        rate = data.funding_data.current_funding_rate
+                        funding_income = max_trade * rate  # Income per funding period
+                        if rate > 0:
+                            funding_impact = f"| {Fore.GREEN}+${funding_income:.2f}/8h funding income{Style.RESET_ALL}"
+                        elif rate < 0:
+                            funding_impact = f"| {Fore.RED}-${abs(funding_income):.2f}/8h funding cost{Style.RESET_ALL}"
                     
-                    logger.info(f"│  └─ ${size:,} trade:")
-                    logger.info(f"│     ├─ Buy ${size:,} perp at avg: ${perp_exec['effective_price']:.4f} ({perp_exec['levels_used']} levels)")
-                    logger.info(f"│     ├─ Sell equivalent spot at avg: ${spot_exec['effective_price']:.4f} ({spot_exec['levels_used']} levels)")
-                    logger.info(f"│     ├─ Actual spread: ${actual_spread:.4f} ({actual_spread_pct:.4f}%)")
-                    logger.info(f"│     └─ Est. profit: ${profit_usd:.2f}")
-                elif not (spot_exec['fully_filled'] and perp_exec['fully_filled']):
-                    logger.info(f"│  └─ ${size:,} trade: ❌ Insufficient liquidity") 
-                    break
+                    print(f"   • {data.base_asset}: {data.long_spot_short_perp_spread_pct:+.4f}% spread | Max: ${max_trade:,.0f} | Est: ${estimated_profit:,.2f} {funding_impact}")
+                    print(f"     └─ {data.expensive_leg} trading at premium | Next funding: {data.funding_data.time_until_funding if data.funding_data else 'N/A'}")
+            
+            if strategy2_opportunities:
+                print(f"\n{Fore.GREEN}📉 Strategy 2 - Long Perp, Short Spot ({len(strategy2_opportunities)} opportunities):{Style.RESET_ALL}")
+                for data in strategy2_opportunities:
+                    max_trade = min(data.perp_ask_depth_5, data.spot_bid_depth_5)
+                    estimated_profit = max_trade * (data.long_perp_short_spot_spread_pct / 100)
+                    
+                    # Funding consideration
+                    funding_impact = ""
+                    if data.funding_data:
+                        rate = data.funding_data.current_funding_rate
+                        funding_cost = max_trade * rate  # Cost per funding period
+                        if rate > 0:
+                            funding_impact = f"| {Fore.RED}-${funding_cost:.2f}/8h funding cost{Style.RESET_ALL}"
+                        elif rate < 0:
+                            funding_impact = f"| {Fore.GREEN}+${abs(funding_cost):.2f}/8h funding income{Style.RESET_ALL}"
+                    
+                    print(f"   • {data.base_asset}: {data.long_perp_short_spot_spread_pct:+.4f}% spread | Max: ${max_trade:,.0f} | Est: ${estimated_profit:,.2f} {funding_impact}")
+                    print(f"     └─ {data.expensive_leg} trading at premium | Next funding: {data.funding_data.time_until_funding if data.funding_data else 'N/A'}")
         else:
-            logger.info(f"└─ Total Depth: Perp Ask ${arb_data.perp_ask_depth_5:,.2f} | Spot Bid ${arb_data.spot_bid_depth_5:,.2f}")
+            print(f"{Fore.YELLOW}ℹ️  No actionable arbitrage opportunities in this cycle (threshold: {self.spread_threshold}%){Style.RESET_ALL}")
         
-        logger.info("")
-        """Print detailed arbitrage status for a single asset"""
-        
-        # Strategy 1 status
-        strategy1_status = "🟢 ACTIONABLE" if arb_data.long_spot_actionable else "🔴 NOT ACTIONABLE"
-        strategy2_status = "🟢 ACTIONABLE" if arb_data.long_perp_actionable else "🔴 NOT ACTIONABLE"
-        
-        logger.info(f"""
-📊 {arb_data.base_asset} ARBITRAGE ANALYSIS:
-
-📈 STRATEGY 1 - Long Spot, Short Perp: {strategy1_status}
-├─ Buy {arb_data.spot_symbol} at: ${arb_data.spot_best_ask:.4f}
-├─ Sell {arb_data.perp_symbol} at: ${arb_data.perp_best_bid:.4f}  
-├─ Spread: ${arb_data.long_spot_short_perp_spread:.4f} ({arb_data.long_spot_short_perp_spread_pct:.4f}%)
-├─ Spot Ask Depth: ${arb_data.spot_ask_depth_5:,.2f}
-└─ Perp Bid Depth: ${arb_data.perp_bid_depth_5:,.2f}
-
-📉 STRATEGY 2 - Long Perp, Short Spot: {strategy2_status}
-├─ Buy {arb_data.perp_symbol} at: ${arb_data.perp_best_ask:.4f}
-├─ Sell {arb_data.spot_symbol} at: ${arb_data.spot_best_bid:.4f}
-├─ Spread: ${arb_data.long_perp_short_spot_spread:.4f} ({arb_data.long_perp_short_spot_spread_pct:.4f}%)
-├─ Perp Ask Depth: ${arb_data.perp_ask_depth_5:,.2f}
-└─ Spot Bid Depth: ${arb_data.spot_bid_depth_5:,.2f}
-        """)
+        print("\n" + "="*150)
     
     def generate_arbitrage_analysis(self) -> Dict:
         """Generate comprehensive analysis of arbitrage patterns"""
@@ -534,11 +641,18 @@ class BackpackArbitrageMonitor:
                     'strategy2_max_spread_pct': asset_data['long_perp_short_spot_spread_pct'].max(),
                     'strategy2_min_spread_pct': asset_data['long_perp_short_spot_spread_pct'].min(),
                     
+                    # Premium analysis
+                    'avg_perp_premium_pct': asset_data['perp_premium_pct'].mean(),
+                    'perp_premium_frequency': (asset_data['expensive_leg'] == 'PERP').sum() / len(asset_data) * 100,
+                    
                     # Depth analysis
                     'avg_spot_bid_depth': asset_data['spot_bid_depth_5'].mean(),
                     'avg_spot_ask_depth': asset_data['spot_ask_depth_5'].mean(),
                     'avg_perp_bid_depth': asset_data['perp_bid_depth_5'].mean(),
                     'avg_perp_ask_depth': asset_data['perp_ask_depth_5'].mean(),
+                    
+                    # Funding analysis
+                    'avg_funding_rate': asset_data['current_funding_rate'].mean() if 'current_funding_rate' in asset_data else 0,
                 }
             
             # Overall market analysis
@@ -567,178 +681,55 @@ class BackpackArbitrageMonitor:
             logger.error(f"Analysis error: {analysis['error']}")
             return
         
-        print("\n" + "=" * 100)
-        print("BACKPACK SPOT-PERP ARBITRAGE ANALYSIS REPORT")
-        print("=" * 100)
+        print("\n" + "=" * 150)
+        print(f"{Fore.CYAN}BACKPACK SPOT-PERP ARBITRAGE ANALYSIS REPORT{Style.RESET_ALL}")
+        print("=" * 150)
+        
+        # Summary table
+        summary_data = []
+        headers = ["Asset", "Total Obs", "S1 Opps", "S1 Avg", "S2 Opps", "S2 Avg", "Avg Premium", "Avg Funding", "Avg Liquidity"]
         
         for base_asset in self.base_assets:
             if base_asset not in analysis:
                 continue
                 
             data = analysis[base_asset]
-            print(f"\n💰 {base_asset} Arbitrage Analysis:")
-            print(f"   Total Observations: {data['total_observations']}")
+            avg_liquidity = (data['avg_spot_bid_depth'] + data['avg_spot_ask_depth'] + 
+                           data['avg_perp_bid_depth'] + data['avg_perp_ask_depth']) / 4
             
-            print(f"\n   📈 Strategy 1 (Long Spot, Short Perp):")
-            print(f"      Actionable Opportunities: {data['strategy1_actionable_count']} ({data['strategy1_actionable_percentage']:.2f}%)")
-            print(f"      Average Spread: {data['strategy1_avg_spread_pct']:.4f}%")
-            print(f"      Spread Range: {data['strategy1_min_spread_pct']:.4f}% - {data['strategy1_max_spread_pct']:.4f}%")
-            
-            print(f"\n   📉 Strategy 2 (Long Perp, Short Spot):")
-            print(f"      Actionable Opportunities: {data['strategy2_actionable_count']} ({data['strategy2_actionable_percentage']:.2f}%)")
-            print(f"      Average Spread: {data['strategy2_avg_spread_pct']:.4f}%")
-            print(f"      Spread Range: {data['strategy2_min_spread_pct']:.4f}% - {data['strategy2_max_spread_pct']:.4f}%")
-            
-            print(f"\n   💧 Liquidity Analysis:")
-            print(f"      Avg Spot Bid Depth: ${data['avg_spot_bid_depth']:,.2f}")
-            print(f"      Avg Spot Ask Depth: ${data['avg_spot_ask_depth']:,.2f}")
-            print(f"      Avg Perp Bid Depth: ${data['avg_perp_bid_depth']:,.2f}")
-            print(f"      Avg Perp Ask Depth: ${data['avg_perp_ask_depth']:,.2f}")
+            summary_data.append([
+                base_asset,
+                data['total_observations'],
+                f"{data['strategy1_actionable_count']} ({data['strategy1_actionable_percentage']:.1f}%)",
+                f"{data['strategy1_avg_spread_pct']:.4f}%",
+                f"{data['strategy2_actionable_count']} ({data['strategy2_actionable_percentage']:.1f}%)",
+                f"{data['strategy2_avg_spread_pct']:.4f}%",
+                f"{data['avg_perp_premium_pct']:.4f}%",
+                f"{data['avg_funding_rate']*100:.4f}%",
+                f"${avg_liquidity:,.0f}"
+            ])
+        
+        print(tabulate(summary_data, headers=headers, tablefmt="grid"))
         
         if 'market_summary' in analysis:
             summary = analysis['market_summary']
-            print(f"\n🎯 Market Summary:")
-            print(f"   Total Strategy 1 Opportunities: {summary['total_strategy1_opportunities']}")
-            print(f"   Total Strategy 2 Opportunities: {summary['total_strategy2_opportunities']}")
+            print(f"\n{Fore.CYAN}🎯 Market Summary:{Style.RESET_ALL}")
             print(f"   Total Arbitrage Opportunities: {summary['total_opportunities']}")
             print(f"   Best Asset for Strategy 1: {summary['most_actionable_asset_strategy1']}")
             print(f"   Best Asset for Strategy 2: {summary['most_actionable_asset_strategy2']}")
         
-        print("\n" + "=" * 100)
-    
-    def create_visualization(self):
-        """Create visualization plots of arbitrage data"""
-        if not os.path.exists(self.csv_filename):
-            logger.warning("No data available for visualization")
-            return
-        
-        try:
-            df = pd.read_csv(self.csv_filename)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-            fig.suptitle('Backpack Spot-Perp Arbitrage Analysis', fontsize=16, fontweight='bold')
-            
-            # Plot 1: Strategy 1 spreads over time
-            ax1 = axes[0, 0]
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                ax1.plot(asset_data['timestamp'], asset_data['long_spot_short_perp_spread_pct'], 
-                        label=f'{asset} Long Spot/Short Perp', marker='o', markersize=2)
-            ax1.axhline(y=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold (0.04%)')
-            ax1.set_title('Strategy 1: Long Spot, Short Perp Spreads')
-            ax1.set_ylabel('Spread (%)')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            # Plot 2: Strategy 2 spreads over time
-            ax2 = axes[0, 1]
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                ax2.plot(asset_data['timestamp'], asset_data['long_perp_short_spot_spread_pct'], 
-                        label=f'{asset} Long Perp/Short Spot', marker='o', markersize=2)
-            ax2.axhline(y=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold')
-            ax2.set_title('Strategy 2: Long Perp, Short Spot Spreads')
-            ax2.set_ylabel('Spread (%)')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            # Plot 3: Actionable opportunities by asset and strategy
-            ax3 = axes[0, 2]
-            strategy1_counts = []
-            strategy2_counts = []
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                strategy1_counts.append(asset_data['long_spot_actionable'].sum())
-                strategy2_counts.append(asset_data['long_perp_actionable'].sum())
-            
-            x = range(len(self.base_assets))
-            width = 0.35
-            ax3.bar([i - width/2 for i in x], strategy1_counts, width, label='Strategy 1', alpha=0.8)
-            ax3.bar([i + width/2 for i in x], strategy2_counts, width, label='Strategy 2', alpha=0.8)
-            ax3.set_title('Actionable Opportunities by Strategy')
-            ax3.set_ylabel('Count')
-            ax3.set_xticks(x)
-            ax3.set_xticklabels(self.base_assets)
-            ax3.legend()
-            
-            # Plot 4: Spot vs Perp depth comparison
-            ax4 = axes[1, 0]
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                avg_spot_depth = (asset_data['spot_bid_depth_5'] + asset_data['spot_ask_depth_5']).mean() / 2
-                avg_perp_depth = (asset_data['perp_bid_depth_5'] + asset_data['perp_ask_depth_5']).mean() / 2
-                ax4.bar([f'{asset}\nSpot', f'{asset}\nPerp'], [avg_spot_depth, avg_perp_depth])
-            ax4.set_title('Average Market Depth Comparison')
-            ax4.set_ylabel('Depth (USD)')
-            
-            # Plot 5: Spread distribution for Strategy 1
-            ax5 = axes[1, 1]
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                ax5.hist(asset_data['long_spot_short_perp_spread_pct'], alpha=0.6, label=f'{asset} Strategy 1', bins=20)
-            ax5.axvline(x=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold')
-            ax5.set_title('Strategy 1 Spread Distribution')
-            ax5.set_xlabel('Spread (%)')
-            ax5.set_ylabel('Frequency')
-            ax5.legend()
-            
-            # Plot 6: Spread distribution for Strategy 2
-            ax6 = axes[1, 2]
-            for asset in self.base_assets:
-                asset_data = df[df['base_asset'] == asset]
-                ax6.hist(asset_data['long_perp_short_spot_spread_pct'], alpha=0.6, label=f'{asset} Strategy 2', bins=20)
-            ax6.axvline(x=self.spread_threshold, color='red', linestyle='--', alpha=0.7, label='Threshold')
-            ax6.set_title('Strategy 2 Spread Distribution')
-            ax6.set_xlabel('Spread (%)')
-            ax6.set_ylabel('Frequency')
-            ax6.legend()
-            
-            plt.tight_layout()
-            plt.savefig('backpack_arbitrage_analysis.png', dpi=300, bbox_inches='tight')
-            plt.show()
-            
-            logger.info("Visualization saved as 'backpack_arbitrage_analysis.png'")
-            
-        except Exception as e:
-            logger.error(f"Error creating visualization: {e}")
+        print("\n" + "=" * 150)
     
     def run_continuous_monitoring(self, interval_seconds: int = 1, max_cycles: int = None):
-        """
-        Run continuous arbitrage monitoring
-        
-        Args:
-            interval_seconds: Time between monitoring cycles
-            max_cycles: Maximum number of cycles (None for infinite)
-        """
+        """Run continuous arbitrage monitoring with enhanced display"""
         cycle_count = 0
         
         try:
             while True:
                 cycle_count += 1
-                logger.info(f"Starting arbitrage monitoring cycle #{cycle_count}")
                 
                 # Monitor current cycle
                 cycle_data = self.monitor_single_cycle()
-                
-                # Print actionable opportunities summary
-                strategy1_opportunities = [data for data in cycle_data if data.long_spot_actionable]
-                strategy2_opportunities = [data for data in cycle_data if data.long_perp_actionable]
-                
-                total_opportunities = len(strategy1_opportunities) + len(strategy2_opportunities)
-                
-                if total_opportunities > 0:
-                    logger.info(f"🚨 ARBITRAGE OPPORTUNITIES FOUND: {total_opportunities}")
-                    if strategy1_opportunities:
-                        logger.info(f"   📈 Strategy 1 (Long Spot/Short Perp): {len(strategy1_opportunities)}")
-                        for data in strategy1_opportunities:
-                            logger.info(f"      {data.base_asset}: {data.long_spot_short_perp_spread_pct:.4f}% spread")
-                    if strategy2_opportunities:
-                        logger.info(f"   📉 Strategy 2 (Long Perp/Short Spot): {len(strategy2_opportunities)}")
-                        for data in strategy2_opportunities:
-                            logger.info(f"      {data.base_asset}: {data.long_perp_short_spot_spread_pct:.4f}% spread")
-                else:
-                    logger.info("ℹ️  No actionable arbitrage opportunities this cycle")
                 
                 # Generate analysis every 10 cycles
                 if cycle_count % 10 == 0:
@@ -749,11 +740,10 @@ class BackpackArbitrageMonitor:
                     break
                 
                 # Wait for next cycle
-                logger.info(f"Waiting {interval_seconds} seconds until next cycle...")
                 time.sleep(interval_seconds)
                 
         except KeyboardInterrupt:
-            logger.info("Monitoring stopped by user")
+            logger.info("\nMonitoring stopped by user")
         except Exception as e:
             logger.error(f"Error in continuous monitoring: {e}")
         finally:
@@ -762,21 +752,12 @@ class BackpackArbitrageMonitor:
 
 def main():
     """Main execution function"""
-    print("🚀 Backpack Spot-Perp Arbitrage Monitor Starting...")
+    print(f"{Fore.CYAN}🚀 Backpack Spot-Perp Arbitrage Monitor with Funding Analysis Starting...{Style.RESET_ALL}")
     
     monitor = BackpackArbitrageMonitor()
     
-    # You can choose different modes:
-    
-    # 1. Single monitoring cycle
-    # monitor.monitor_single_cycle()
-    # monitor.print_analysis_report()
-    
-    # 2. Continuous monitoring (uncomment to use)
+    # Run continuous monitoring
     monitor.run_continuous_monitoring(interval_seconds=1, max_cycles=100)
-    
-    # 3. Generate visualization (uncomment to use)
-    # monitor.create_visualization()
 
 if __name__ == "__main__":
     main()
